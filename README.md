@@ -5,9 +5,13 @@
 Logi Options+ lets you set the backlight brightness and an auto-off _timeout_,
 but there's no "always on" option — after about 5 seconds of not typing, the
 backlight fades out. `mxlight` is a tiny (~150 KB), dependency-free Windows
-program that keeps it lit: run it in a terminal, and the backlight stays on until
-you stop it with **Ctrl+C**.
+program that keeps it lit: it runs quietly in your **system tray**, and you click
+its icon to pause or resume whenever you like.
 
+- **Lives in the system tray.** No console window. **Left-click** the icon to
+  pause/resume; **right-click** for a menu (Enabled, Start with Windows, Quit).
+  The icon is colour-coded: green = keeping the backlight on, amber = searching
+  for the keyboard, grey = paused.
 - **No install, no runtime, no dependencies.** A single native `.exe`. No .NET,
   no Python, no drivers — just the HID APIs built into Windows.
 - **Tiny footprint.** It sleeps between short keepalive pulses; near-zero CPU.
@@ -33,16 +37,25 @@ This finds the MSVC toolchain automatically and produces `build\mxlight.exe`.
 
 ## Use
 
+Double-click `build\mxlight.exe` (or run it from a terminal — no window opens):
+
 ```bat
 build\mxlight.exe
 ```
 
-That's it. Leave it running and your backlight stays on; press **Ctrl+C** to
-stop. If the keyboard is asleep or switched to another device (Easy-Switch), it
-will wait and start keeping the light on as soon as the keyboard comes back.
+An icon appears in the system tray and the backlight starts staying on.
+
+- **Left-click** the icon to pause/resume.
+- **Right-click** for a menu: toggle **Enabled**, toggle **Start with Windows**
+  (launches `mxlight` automatically at sign-in), or **Quit**.
+
+If the keyboard is asleep or switched to another device (Easy-Switch), the icon
+turns amber and it starts keeping the light on again as soon as the keyboard
+comes back.
 
 > Tip: make sure the MX Keys is switched to this PC and awake (tap a key) the
-> first time you run it.
+> first time you run it. If you don't see the icon, check the tray's hidden-icons
+> overflow (the `^` chevron) and drag it onto the taskbar to keep it visible.
 
 ---
 

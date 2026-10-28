@@ -1,10 +1,14 @@
 /*
  *  WHAT IT DOES
  *  ------------
- *  Run it in a terminal and it keeps the keyboard's backlight lit; press Ctrl+C
- *  and it stops.
+ *  Lives in the Windows system tray and keeps the keyboard's backlight lit.
+ *  Left-click the tray icon to pause/resume; right-click for a menu (pause,
+ *  start-with-Windows, quit). The icon is colour-coded:
+ *      green  - backlight is being kept on
+ *      amber  - running, but searching for the keyboard / receiver
+ *      grey   - paused
  *
- *  Uses only Windows' built-in HID APIs - no third-party dependencies.
+ *  Uses only Windows' built-in APIs - no third-party dependencies.
  *  MIT License. Copyright (c) 2026 Roman Zrajevsky.
  */
 
@@ -12,14 +16,19 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <windows.h>  // Core Win32 types/handles: HANDLE, DWORD, GUID, CreateFileA, etc
+#include <shellapi.h> // Shell_NotifyIcon / NOTIFYICONDATA (the tray icon)
 #include <hidsdi.h>   // HidD_*, HidP_*
 #include <setupapi.h> // SetupDi* device enumeration
-#include <stdio.h>    // printf / fprintf / setvbuf
+#include <string.h>   // strcpy / strstr / memset / memcpy
 #include <stdint.h>   // fixed-width integer types: uint8_t, uint16_t, etc
 
 // Links the following libraries when compiling
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "shell32.lib") // Shell_NotifyIcon
+#pragma comment(lib, "user32.lib")  // window + menu + icon APIs
+#pragma comment(lib, "gdi32.lib")   // GDI used to draw the tray icons
+#pragma comment(lib, "advapi32.lib") // registry (start-with-Windows)
 
 // USB Vendor ID assigned to Logitech
 #define LOGITECH_VID 0x046D
@@ -52,30 +61,57 @@
  * slot 0xFF too. We try all of them and see which ones reply. */
 static const uint8_t SLOTS[] = {1, 2, 3, 4, 5, 6, 0xFF};
 
-// Signaled by the console control handler so the main loop can exit cleanly
-// (close device handles) instead of being killed mid-operation. It is global
-// because the handler runs on its own OS thread and has no other way in.
+/* ------------------------------------------------------------------------- *
+ *  Tray / threading state
+ *  ----------------------
+ *  The backlight keepalive runs on a worker thread (worker_thread, below) so
+ *  the main thread is free to pump the window message loop the tray icon needs.
+ *  These globals are how the UI thread and the worker thread talk to each other.
+ * ------------------------------------------------------------------------- */
+
+// Manual-reset event: signaled once, when the app is quitting, so the worker
+// wakes from any wait and winds down (closing device handles cleanly).
 static HANDLE g_stop = NULL;
 
-// Windows calls this (on a thread it spins up) for console control events
-static BOOL WINAPI ctrl_handler(DWORD type)
-{
-    // Treat Ctrl+C, Ctrl+Break and the console-close button as "stop"
-    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT)
-    {
-        if (g_stop)
-            SetEvent(g_stop); // wake the main loop so it can wind down
-        return TRUE;          // we handled it; don't run the default terminator
-    }
-    return FALSE; // not ours; let the next handler / default action run
-}
+// Auto-/manual-reset event pulsed whenever the user toggles pause/resume, so the
+// worker stops sleeping and re-checks g_enabled instead of pulsing on a dead loop.
+static HANDLE g_wake = NULL;
 
-// Wait up to ms milliseconds, returning 1 if Ctrl+C was pressed meanwhile.
-// Like Sleep(ms), but wakes early the instant g_stop is signaled.
+// 1 = keep the backlight on, 0 = paused. Toggled from the UI thread, read by the
+// worker; LONG + Interlocked* so the cross-thread write is atomic.
+static volatile LONG g_enabled = 1;
+
+static HWND g_hwnd = NULL;      // our hidden message window (owns the tray icon)
+static NOTIFYICONDATAA g_nid;   // the tray icon descriptor we add/modify/remove
+static HICON g_ico_on = NULL;   // green  - backlight actively kept on
+static HICON g_ico_wait = NULL; // amber  - running but searching
+static HICON g_ico_off = NULL;  // grey   - paused
+static UINT g_taskbar_created;  // "TaskbarCreated" broadcast (re-add icon on Explorer restart)
+
+// Current display status; only ever written on the UI thread (menu handler and
+// the WM_STATUS handler), so it needs no locking.
+enum { ST_PAUSED, ST_NO_RECEIVER, ST_SEARCHING, ST_ACTIVE };
+static int g_status = ST_PAUSED;
+
+#define WM_TRAY (WM_APP + 1)   // tray-icon notifications arrive as this message
+#define WM_STATUS (WM_APP + 2) // worker -> UI: "status changed to wParam"
+
+#define ID_TOGGLE 1    // menu: pause / resume
+#define ID_AUTOSTART 2 // menu: start with Windows
+#define ID_QUIT 3      // menu: quit
+
+// Wait up to ms milliseconds. Returns 1 if the app is quitting (g_stop fired),
+// 0 otherwise. Also wakes early (returning 0) when the user toggles pause/resume
+// so the worker can react promptly instead of finishing its full sleep.
 static int interrupted(DWORD ms)
 {
-    // WAIT_OBJECT_0 means the event fired before the timeout; else it timed out
-    return WaitForSingleObject(g_stop, ms) == WAIT_OBJECT_0;
+    HANDLE h[2] = {g_stop, g_wake};
+    DWORD w = WaitForMultipleObjects(2, h, FALSE, ms);
+    if (w == WAIT_OBJECT_0)
+        return 1;                // quitting
+    if (w == WAIT_OBJECT_0 + 1)
+        ResetEvent(g_wake);      // toggle: consume the signal, fall through
+    return 0;
 }
 
 /* One "channel" = one opened HID collection (one Win32 file handle). A single
@@ -587,34 +623,44 @@ static void bl_keepalive(Dev *d, uint8_t idx, uint8_t bl)
     bl_pulse(d, idx, bl, 0x01, 0x00); // ON, static effect, no gap
 }
 
-int main(void)
+/* ------------------------------------------------------------------------- *
+ *  Worker thread: the original keepalive loop, now driven by g_enabled.
+ *  When paused it releases its devices and sleeps until resumed or quit.
+ *  Status changes are reported to the UI thread via PostMessage(WM_STATUS); it
+ *  posts only on a *change* of status, so the tray isn't updated needlessly.
+ * ------------------------------------------------------------------------- */
+static DWORD WINAPI worker_thread(LPVOID arg)
 {
-    // Manual-reset event used to break out of the loop on Ctrl+C
-    g_stop = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (!g_stop)
-    {
-        fprintf(stderr, "Failed to create stop event (error %lu).\n", GetLastError());
-        return 1;
-    }
-    SetConsoleCtrlHandler(ctrl_handler, TRUE); // register our Ctrl+C handler
-
-    // Print status immediately instead of buffering it (matters when output is
-    // piped/redirected rather than going to a live console)
-    setvbuf(stdout, NULL, _IONBF, 0);
-
-    printf("mxlight: keeping the Logitech keyboard backlight on. Press Ctrl+C to stop.\n");
-
+    (void)arg;
     Cand cands[MAX_CANDIDATES];
     Dev devs[MAX_GROUPS];
-    int ndev = 0;   // number of open devices
-    int have = 0;   // 1 once we have the device list open
-    int misses = 0; // consecutive "keyboard not found" scans
-    int state = -1; // last reported state: -1 unknown, 0 offline, 1 live
+    int ndev = 0;        // number of open devices
+    int have = 0;        // 1 once we have the device list open
+    int misses = 0;      // consecutive "keyboard not found" scans
+    int posted = -1;     // last status we told the UI about (-1 = none yet)
 
     for (;;)
     {
-        // (Re)build the device list if we don't have one (startup, or after the
-        // receiver seems to have gone away)
+        // Paused: drop any open devices (so another app can grab them and the
+        // backlight returns to normal) and wait until resumed or quit.
+        if (!g_enabled)
+        {
+            for (int i = 0; i < ndev; i++)
+                close_device(&devs[i]);
+            ndev = 0;
+            have = 0;
+            posted = -1; // re-report status after we resume
+
+            HANDLE h[2] = {g_stop, g_wake};
+            DWORD w = WaitForMultipleObjects(2, h, FALSE, INFINITE);
+            if (w == WAIT_OBJECT_0)
+                break;            // quitting
+            ResetEvent(g_wake);   // consume the resume signal
+            continue;
+        }
+
+        // (Re)build the device list if we don't have one (startup, resume, or
+        // after the receiver seems to have gone away)
         if (!have)
         {
             for (int i = 0; i < ndev; i++)
@@ -624,8 +670,9 @@ int main(void)
             have = (ndev > 0);
             if (!have)
             {
-                fprintf(stderr, "No Logitech HID++ receiver found. Is it plugged in? Retrying...\n");
-                if (interrupted(3000)) // wait 3s (or until Ctrl+C) then rescan
+                if (posted != ST_NO_RECEIVER)
+                    PostMessage(g_hwnd, WM_STATUS, (WPARAM)(posted = ST_NO_RECEIVER), 0);
+                if (interrupted(3000)) // wait 3s (or until quit/toggle) then rescan
                     break;
                 continue;
             }
@@ -638,11 +685,8 @@ int main(void)
         {
             bl_keepalive(d, idx, bl); // one off->on pulse
             misses = 0;
-            if (state != 1) // only announce on a state change
-            {
-                printf("Keyboard found - backlight will stay on.\n");
-                state = 1;
-            }
+            if (posted != ST_ACTIVE)
+                PostMessage(g_hwnd, WM_STATUS, (WPARAM)(posted = ST_ACTIVE), 0);
             if (interrupted(PULSE_INTERVAL_MS)) // sleep until the next pulse
                 break;
         }
@@ -650,11 +694,8 @@ int main(void)
         {
             // Not reachable right now. After several misses, assume the receiver
             // changed and rebuild the device list; otherwise just retry sooner.
-            if (state != 0)
-            {
-                printf("Keyboard not reachable yet (asleep or on another device). Waiting...\n");
-                state = 0;
-            }
+            if (posted != ST_SEARCHING)
+                PostMessage(g_hwnd, WM_STATUS, (WPARAM)(posted = ST_SEARCHING), 0);
             if (++misses >= 5)
             {
                 have = 0; // force a re-enumerate next loop
@@ -665,10 +706,276 @@ int main(void)
         }
     }
 
-    // Clean shutdown on Ctrl+C
     for (int i = 0; i < ndev; i++)
         close_device(&devs[i]);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- *
+ *  Tray icon helpers
+ * ------------------------------------------------------------------------- */
+
+// Build a 32x32 tray icon: a filled circle of colour 'c' on a transparent
+// background. Drawn with GDI so we need no external .ico file.
+static HICON make_icon(COLORREF c)
+{
+    const int sz = 32;
+    HDC screen = GetDC(NULL);
+    HDC dc = CreateCompatibleDC(screen);
+
+    // Colour bitmap: black everywhere, then a filled circle in the wanted colour.
+    HBITMAP color = CreateCompatibleBitmap(screen, sz, sz);
+    HBITMAP oldc = (HBITMAP)SelectObject(dc, color);
+    RECT r = {0, 0, sz, sz};
+    FillRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    HBRUSH br = CreateSolidBrush(c);
+    HPEN pen = CreatePen(PS_SOLID, 1, c);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, br);
+    HPEN op = (HPEN)SelectObject(dc, pen);
+    Ellipse(dc, 3, 3, sz - 3, sz - 3);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+    SelectObject(dc, oldc);
+
+    // AND mask (1bpp): white (1) = transparent, black (0) = opaque. So fill white
+    // then stamp a black circle -> only the circle shows, corners are see-through.
+    HBITMAP mask = CreateBitmap(sz, sz, 1, 1, NULL);
+    HBITMAP oldm = (HBITMAP)SelectObject(dc, mask);
+    FillRect(dc, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
+    SelectObject(dc, GetStockObject(BLACK_BRUSH));
+    SelectObject(dc, GetStockObject(BLACK_PEN));
+    Ellipse(dc, 3, 3, sz - 3, sz - 3);
+    SelectObject(dc, oldm);
+
+    ICONINFO ii = {0};
+    ii.fIcon = TRUE;
+    ii.hbmColor = color;
+    ii.hbmMask = mask;
+    HICON ico = CreateIconIndirect(&ii); // makes its own copies of the bitmaps
+
+    DeleteObject(color);
+    DeleteObject(mask);
+    DeleteDC(dc);
+    ReleaseDC(NULL, screen);
+    return ico;
+}
+
+// Push the current g_status to the tray icon (icon colour + tooltip text).
+static void update_tray(void)
+{
+    const char *tip;
+    HICON ic;
+    switch (g_status)
+    {
+    case ST_ACTIVE:
+        tip = "mxlight: backlight staying on (click to pause)";
+        ic = g_ico_on;
+        break;
+    case ST_SEARCHING:
+        tip = "mxlight: looking for the keyboard...";
+        ic = g_ico_wait;
+        break;
+    case ST_NO_RECEIVER:
+        tip = "mxlight: no Logitech receiver found";
+        ic = g_ico_wait;
+        break;
+    default:
+        tip = "mxlight: paused (click to resume)";
+        ic = g_ico_off;
+        break;
+    }
+    g_nid.uFlags = NIF_ICON | NIF_TIP;
+    g_nid.hIcon = ic;
+    strcpy(g_nid.szTip, tip);
+    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+}
+
+// Pause/resume from the UI thread. Updates the tray immediately for snappy
+// feedback, then wakes the worker so it reacts.
+static void set_enabled(int on)
+{
+    InterlockedExchange(&g_enabled, on ? 1 : 0);
+    g_status = on ? ST_SEARCHING : ST_PAUSED;
+    update_tray();
+    SetEvent(g_wake);
+}
+
+/* ------------------------------------------------------------------------- *
+ *  "Start with Windows" via the per-user Run registry key.
+ * ------------------------------------------------------------------------- */
+#define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_VAL "mxlight"
+
+static int autostart_enabled(void)
+{
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return 0;
+    LONG rc = RegQueryValueExA(k, RUN_VAL, NULL, NULL, NULL, NULL);
+    RegCloseKey(k);
+    return rc == ERROR_SUCCESS;
+}
+
+static void autostart_set(int on)
+{
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS)
+        return;
+    if (on)
+    {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+        if (n > 0 && n < MAX_PATH)
+            RegSetValueExA(k, RUN_VAL, 0, REG_SZ, (const BYTE *)path, n + 1);
+    }
+    else
+    {
+        RegDeleteValueA(k, RUN_VAL);
+    }
+    RegCloseKey(k);
+}
+
+// Build and show the right-click context menu at the cursor.
+static void show_menu(HWND hwnd)
+{
+    HMENU m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), ID_TOGGLE, "Enabled");
+    AppendMenuA(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), ID_AUTOSTART, "Start with Windows");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, ID_QUIT, "Quit");
+
+    // Required so the menu dismisses correctly when clicking elsewhere.
+    SetForegroundWindow(hwnd);
+    POINT pt;
+    GetCursorPos(&pt);
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(m);
+}
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    // Explorer restarted -> our icon was wiped from the tray; re-add it.
+    if (msg == g_taskbar_created)
+    {
+        Shell_NotifyIconA(NIM_ADD, &g_nid);
+        update_tray();
+        return 0;
+    }
+
+    switch (msg)
+    {
+    case WM_TRAY:
+        // Left-click toggles; right-click (or the menu key) opens the menu.
+        if (LOWORD(lp) == WM_LBUTTONUP)
+            set_enabled(!g_enabled);
+        else if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)
+            show_menu(hwnd);
+        return 0;
+
+    case WM_STATUS:
+        // Worker reported a status; ignore it while paused (a stale "active"
+        // posted just before the user paused must not re-light the icon).
+        if (g_enabled)
+        {
+            g_status = (int)wp;
+            update_tray();
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wp))
+        {
+        case ID_TOGGLE:
+            set_enabled(!g_enabled);
+            break;
+        case ID_AUTOSTART:
+            autostart_set(!autostart_enabled());
+            break;
+        case ID_QUIT:
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+
+    case WM_DESTROY:
+        Shell_NotifyIconA(NIM_DELETE, &g_nid);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
+{
+    (void)hPrev;
+    (void)cmd;
+    (void)show;
+
+    // Single instance: a second launch would fight the first over the device.
+    HANDLE mutex = CreateMutexA(NULL, TRUE, "mxlight_single_instance");
+    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0;
+
+    g_stop = CreateEvent(NULL, TRUE, FALSE, NULL);  // manual-reset: quit signal
+    g_wake = CreateEvent(NULL, FALSE, FALSE, NULL); // auto-reset: toggle signal
+    if (!g_stop || !g_wake)
+        return 1;
+
+    g_ico_on = make_icon(RGB(40, 200, 80));    // green
+    g_ico_wait = make_icon(RGB(230, 170, 30)); // amber
+    g_ico_off = make_icon(RGB(130, 130, 130)); // grey
+
+    // A hidden window just to own the tray icon and receive its messages.
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = "mxlight_wnd";
+    RegisterClassA(&wc);
+    g_hwnd = CreateWindowA("mxlight_wnd", "mxlight", 0, 0, 0, 0, 0,
+                           HWND_MESSAGE, NULL, hInst, NULL);
+    if (!g_hwnd)
+        return 1;
+
+    // So we can restore the icon if Explorer (the taskbar) restarts.
+    g_taskbar_created = RegisterWindowMessageA("TaskbarCreated");
+
+    // Add the tray icon (starts "searching" since the worker runs enabled).
+    memset(&g_nid, 0, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    g_nid.hIcon = g_ico_wait;
+    strcpy(g_nid.szTip, "mxlight: starting...");
+    Shell_NotifyIconA(NIM_ADD, &g_nid);
+    g_status = ST_SEARCHING;
+
+    HANDLE worker = CreateThread(NULL, 0, worker_thread, NULL, 0, NULL);
+
+    // Pump messages until WM_QUIT (posted by WM_DESTROY on Quit).
+    MSG m;
+    while (GetMessage(&m, NULL, 0, 0) > 0)
+    {
+        TranslateMessage(&m);
+        DispatchMessage(&m);
+    }
+
+    // Wind the worker down cleanly so it closes its device handles.
+    SetEvent(g_stop);
+    if (worker)
+    {
+        WaitForSingleObject(worker, 2000);
+        CloseHandle(worker);
+    }
+
+    if (g_ico_on) DestroyIcon(g_ico_on);
+    if (g_ico_wait) DestroyIcon(g_ico_wait);
+    if (g_ico_off) DestroyIcon(g_ico_off);
     CloseHandle(g_stop);
-    printf("\nStopped. The backlight will return to its normal behaviour.\n");
+    CloseHandle(g_wake);
+    if (mutex) CloseHandle(mutex);
     return 0;
 }
