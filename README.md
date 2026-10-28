@@ -51,18 +51,19 @@ The icon color tells you what's happening:
 
 ---
 
-## Where it installs
+## Start with Windows
 
-`mxlight` writes nothing until you ask it to. The only things it ever touches:
+`mxlight` needs no installer and writes nothing until you ask it to. Turning on
+**Start with Windows** adds a single registry value under
+`HKCU\...\CurrentVersion\Run` that points at the exe where it currently sits.
+Turning it off removes that value. That's the only thing it ever changes.
 
-- **Start with Windows** copies the exe to `%LOCALAPPDATA%\mxlight\mxlight.exe`
-  and adds one registry value under `HKCU\...\CurrentVersion\Run`. Copying to a
-  fixed spot is what lets autostart keep working after you delete the file you
-  first ran.
-- Turning off **Start with Windows** removes that registry value.
+Because it points at the file's current location, **put `mxlight.exe` somewhere
+permanent before you enable this** (for example a `C:\Tools\mxlight\` folder),
+not your Downloads folder. If you move the exe later, just toggle the option off
+and back on.
 
-To remove the app completely: **Quit** it, then delete the `%LOCALAPPDATA%\mxlight`
-folder.
+To remove the app: **Quit** it, turn off Start with Windows, and delete the exe.
 
 ---
 

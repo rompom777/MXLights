@@ -19,8 +19,7 @@
 #include <shellapi.h> // Shell_NotifyIcon / NOTIFYICONDATA (the tray icon)
 #include <hidsdi.h>   // HidD_*, HidP_*
 #include <setupapi.h> // SetupDi* device enumeration
-#include <string.h>   // strcpy / strstr / memset / memcpy / _stricmp
-#include <stdio.h>    // snprintf (building the install path)
+#include <string.h>   // strcpy / strstr / memset / memcpy
 #include <stdint.h>   // fixed-width integer types: uint8_t, uint16_t, etc
 
 // Links the following libraries when compiling
@@ -819,35 +818,6 @@ static int autostart_enabled(void)
     return rc == ERROR_SUCCESS;
 }
 
-/* Canonical install location: %LOCALAPPDATA%\mxlight\mxlight.exe. When the user
- * turns on "Start with Windows" we copy ourselves here and register THIS path, so
- * the autostart entry keeps working even if they delete the download they first
- * launched from. Returns 1 and fills 'installed' if a usable copy now exists. */
-static int ensure_installed(char *installed, size_t n)
-{
-    char base[MAX_PATH];
-    DWORD k = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    if (k == 0 || k >= MAX_PATH)
-        return 0;
-
-    char dir[MAX_PATH];
-    snprintf(dir, sizeof(dir), "%s\\mxlight", base);
-    snprintf(installed, n, "%s\\mxlight.exe", dir);
-
-    char cur[MAX_PATH];
-    if (GetModuleFileNameA(NULL, cur, MAX_PATH) == 0)
-        return 0;
-
-    // Already running from the install location: the copy is us; nothing to do.
-    if (_stricmp(cur, installed) == 0)
-        return 1;
-
-    CreateDirectoryA(dir, NULL); // harmless if the folder already exists
-    // The single-instance mutex guarantees no other mxlight is running, so the
-    // destination (if it already exists) isn't locked and can be overwritten.
-    return CopyFileA(cur, installed, FALSE) ? 1 : 0;
-}
-
 static void autostart_set(int on)
 {
     HKEY k;
@@ -855,17 +825,15 @@ static void autostart_set(int on)
         return;
     if (on)
     {
-        // Register the stable installed copy; fall back to our current path only
-        // if the copy couldn't be made for some reason.
-        char installed[MAX_PATH], cur[MAX_PATH];
-        const char *target = installed;
-        if (!ensure_installed(installed, sizeof(installed)))
-        {
-            GetModuleFileNameA(NULL, cur, MAX_PATH);
-            target = cur;
-        }
-        RegSetValueExA(k, RUN_VAL, 0, REG_SZ,
-                       (const BYTE *)target, (DWORD)(strlen(target) + 1));
+        // Register this exe at its current location. We deliberately do NOT copy
+        // ourselves into %APPDATA% first: an executable that drops a copy of
+        // itself into AppData and then adds a Run key is the textbook
+        // "dropper + persistence" pattern, and antivirus behavioural engines
+        // flag it on sight. Pointing at the current path is what normal apps do.
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+        if (n > 0 && n < MAX_PATH)
+            RegSetValueExA(k, RUN_VAL, 0, REG_SZ, (const BYTE *)path, n + 1);
     }
     else
     {
@@ -944,8 +912,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             autostart_set(on);
             if (on)
                 show_balloon("mxlight",
-                             "Installed a copy and set it to start with Windows. "
-                             "You can delete the file you launched this from.");
+                             "mxlight will start with Windows. Keep this .exe "
+                             "where it is (don't move or delete the file).");
             break;
         }
         case ID_QUIT:
