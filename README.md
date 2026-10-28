@@ -15,9 +15,11 @@ tray and keeps the light on. Click the icon to pause or resume whenever you want
 
 1. Download **`mxlight.exe`** from the
    [latest release](https://github.com/rompom777/MXLights/releases/latest).
-2. Run it. An icon appears in your system tray and the backlight starts staying on.
-3. _(Optional)_ Right-click the icon and pick **Start with Windows** to launch it
-   automatically at sign-in.
+2. Run it whenever you want the light to stay on. An icon appears in your system
+   tray and the backlight starts staying on.
+
+Want it on all the time? Just leave it running (or keep the exe handy and launch
+it when you need it).
 
 > On first run, Windows SmartScreen may pop up a blue "Windows protected your PC"
 > box, because the exe isn't code-signed (certificates cost money). Click
@@ -32,8 +34,7 @@ tray and keeps the light on. Click the icon to pause or resume whenever you want
 ## Using it
 
 - **Left-click** the icon to pause or resume.
-- **Right-click** for a menu: toggle **Enabled**, toggle **Start with Windows**,
-  or **Quit**.
+- **Right-click** for a menu: toggle **Enabled** or **Quit**.
 
 The icon color tells you what's happening:
 
@@ -51,19 +52,11 @@ The icon color tells you what's happening:
 
 ---
 
-## Start with Windows
+## No installer, nothing left behind
 
-`mxlight` needs no installer and writes nothing until you ask it to. Turning on
-**Start with Windows** adds a single registry value under
-`HKCU\...\CurrentVersion\Run` that points at the exe where it currently sits.
-Turning it off removes that value. That's the only thing it ever changes.
-
-Because it points at the file's current location, **put `mxlight.exe` somewhere
-permanent before you enable this** (for example a `C:\Tools\mxlight\` folder),
-not your Downloads folder. If you move the exe later, just toggle the option off
-and back on.
-
-To remove the app: **Quit** it, turn off Start with Windows, and delete the exe.
+`mxlight` is a single exe. It installs nothing, writes no registry keys, and
+leaves no files anywhere. Run it when you want it; close it (right-click →
+**Quit**) when you don't. To remove it, just delete the exe.
 
 ---
 

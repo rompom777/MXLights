@@ -45,7 +45,7 @@ echo Compiling mxlight.exe ...
 REM /link /SUBSYSTEM:WINDOWS makes it a GUI (tray) app so no console window opens.
 cl /nologo /W4 /O2 /MT /Fe:"%OUT%\mxlight.exe" /Fo:"%OUT%\\" ^
    "%ROOT%src\mxlight.c" ^
-   setupapi.lib hid.lib shell32.lib user32.lib gdi32.lib advapi32.lib ^
+   setupapi.lib hid.lib shell32.lib user32.lib gdi32.lib ^
    /link /SUBSYSTEM:WINDOWS
 if %errorlevel% neq 0 (
     echo [ERROR] Build failed.

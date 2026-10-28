@@ -3,7 +3,7 @@
  *  ------------
  *  Lives in the Windows system tray and keeps the keyboard's backlight lit.
  *  Left-click the tray icon to pause/resume; right-click for a menu (pause,
- *  start-with-Windows, quit). The icon is colour-coded:
+ *  quit). The icon is colour-coded:
  *      green  - backlight is being kept on
  *      amber  - running, but searching for the keyboard / receiver
  *      grey   - paused
@@ -28,7 +28,6 @@
 #pragma comment(lib, "shell32.lib") // Shell_NotifyIcon
 #pragma comment(lib, "user32.lib")  // window + menu + icon APIs
 #pragma comment(lib, "gdi32.lib")   // GDI used to draw the tray icons
-#pragma comment(lib, "advapi32.lib") // registry (start-with-Windows)
 
 // USB Vendor ID assigned to Logitech
 #define LOGITECH_VID 0x046D
@@ -96,9 +95,8 @@ static int g_status = ST_PAUSED;
 #define WM_TRAY (WM_APP + 1)   // tray-icon notifications arrive as this message
 #define WM_STATUS (WM_APP + 2) // worker -> UI: "status changed to wParam"
 
-#define ID_TOGGLE 1    // menu: pause / resume
-#define ID_AUTOSTART 2 // menu: start with Windows
-#define ID_QUIT 3      // menu: quit
+#define ID_TOGGLE 1 // menu: pause / resume
+#define ID_QUIT 2   // menu: quit
 
 // Wait up to ms milliseconds. Returns 1 if the app is quitting (g_stop fired),
 // 0 otherwise. Also wakes early (returning 0) when the user toggles pause/resume
@@ -802,63 +800,11 @@ static void set_enabled(int on)
     SetEvent(g_wake);
 }
 
-/* ------------------------------------------------------------------------- *
- *  "Start with Windows" via the per-user Run registry key.
- * ------------------------------------------------------------------------- */
-#define RUN_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-#define RUN_VAL "mxlight"
-
-static int autostart_enabled(void)
-{
-    HKEY k;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
-        return 0;
-    LONG rc = RegQueryValueExA(k, RUN_VAL, NULL, NULL, NULL, NULL);
-    RegCloseKey(k);
-    return rc == ERROR_SUCCESS;
-}
-
-static void autostart_set(int on)
-{
-    HKEY k;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS)
-        return;
-    if (on)
-    {
-        // Register this exe at its current location. We deliberately do NOT copy
-        // ourselves into %APPDATA% first: an executable that drops a copy of
-        // itself into AppData and then adds a Run key is the textbook
-        // "dropper + persistence" pattern, and antivirus behavioural engines
-        // flag it on sight. Pointing at the current path is what normal apps do.
-        char path[MAX_PATH];
-        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-        if (n > 0 && n < MAX_PATH)
-            RegSetValueExA(k, RUN_VAL, 0, REG_SZ, (const BYTE *)path, n + 1);
-    }
-    else
-    {
-        RegDeleteValueA(k, RUN_VAL);
-    }
-    RegCloseKey(k);
-}
-
-// Show a brief tray balloon notification (restored to a normal tip on the next
-// update_tray()).
-static void show_balloon(const char *title, const char *text)
-{
-    g_nid.uFlags = NIF_INFO;
-    g_nid.dwInfoFlags = NIIF_INFO;
-    strcpy(g_nid.szInfoTitle, title);
-    strcpy(g_nid.szInfo, text);
-    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
-}
-
 // Build and show the right-click context menu at the cursor.
 static void show_menu(HWND hwnd)
 {
     HMENU m = CreatePopupMenu();
     AppendMenuA(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), ID_TOGGLE, "Enabled");
-    AppendMenuA(m, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), ID_AUTOSTART, "Start with Windows");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING, ID_QUIT, "Quit");
 
@@ -906,16 +852,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_TOGGLE:
             set_enabled(!g_enabled);
             break;
-        case ID_AUTOSTART:
-        {
-            int on = !autostart_enabled();
-            autostart_set(on);
-            if (on)
-                show_balloon("mxlight",
-                             "mxlight will start with Windows. Keep this .exe "
-                             "where it is (don't move or delete the file).");
-            break;
-        }
         case ID_QUIT:
             DestroyWindow(hwnd);
             break;
