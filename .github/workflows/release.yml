@@ -1,0 +1,54 @@
+name: Release
+
+# Builds and publishes a signed mxlight.exe whenever a version tag (e.g. v1.0) is
+# pushed. The build runs entirely on GitHub's servers from the tagged source, so
+# the whole process is publicly auditable, and the provenance attestation lets
+# anyone cryptographically prove the published exe came from this exact commit.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write      # create the GitHub Release and upload the exe
+  id-token: write      # OIDC identity used to sign the provenance attestation
+  attestations: write  # record the build-provenance attestation
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      # windows-latest ships with Visual Studio; build.bat finds the toolchain
+      # itself via vswhere, so no extra setup step is needed.
+      - name: Build mxlight.exe
+        shell: cmd
+        run: build.bat
+
+      - name: Compute SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash build\mxlight.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  mxlight.exe" | Out-File -Encoding ascii build\mxlight.exe.sha256
+          Write-Host "SHA-256: $hash"
+
+      # Produces a signed SLSA provenance attestation binding the exe's digest to
+      # this workflow run and source commit. Verify with:
+      #   gh attestation verify mxlight.exe --repo <owner>/<repo>
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: build/mxlight.exe
+
+      # Uses the preinstalled GitHub CLI (no third-party action) to publish.
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" `
+            build/mxlight.exe build/mxlight.exe.sha256 `
+            --title "$env:GITHUB_REF_NAME" `
+            --generate-notes

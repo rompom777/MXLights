@@ -24,38 +24,92 @@ its icon to pause or resume whenever you like.
 
 ---
 
-## Build
+## Quick start (download)
 
-Requires **Visual Studio 2022** (or the bare Build Tools) with the _Desktop
-development with C++_ workload. No other dependencies.
+1. Download **`mxlight.exe`** from the
+   [**latest release**](https://github.com/rompom777/MXLights/releases/latest).
+2. Run it. An icon appears in the system tray and the backlight starts staying on.
+3. _(Optional)_ Right-click the icon → **Start with Windows** to launch it
+   automatically at sign-in. This installs a copy to a permanent location for you
+   (see [Where it installs](#where-it-installs)), so you can delete the download.
 
-```bat
-build.bat
-```
+That's the whole setup — no toolchain, no clone, no admin rights.
 
-This finds the MSVC toolchain automatically and produces `build\mxlight.exe`.
+> On first run Windows SmartScreen may show a blue _"Windows protected your PC"_
+> box because the exe isn't code-signed (signing certificates cost money). Click
+> **More info → Run anyway**. If you'd rather not take my word that the download
+> is safe, see [Verifying the download](#verifying-the-download) — you can
+> cryptographically prove it was built from this source — or
+> [build it yourself](#build-it-yourself).
 
-## Use
+### Using it
 
-Double-click `build\mxlight.exe` (or run it from a terminal — no window opens):
-
-```bat
-build\mxlight.exe
-```
-
-An icon appears in the system tray and the backlight starts staying on.
-
-- **Left-click** the icon to pause/resume.
-- **Right-click** for a menu: toggle **Enabled**, toggle **Start with Windows**
-  (launches `mxlight` automatically at sign-in), or **Quit**.
+- **Left-click** the tray icon to pause/resume.
+- **Right-click** for a menu: toggle **Enabled**, toggle **Start with Windows**,
+  or **Quit**.
+- The icon is colour-coded: 🟢 green = keeping the backlight on, 🟡 amber =
+  running but searching for the keyboard, ⚪ grey = paused.
 
 If the keyboard is asleep or switched to another device (Easy-Switch), the icon
-turns amber and it starts keeping the light on again as soon as the keyboard
-comes back.
+turns amber and it resumes keeping the light on as soon as the keyboard is back.
 
 > Tip: make sure the MX Keys is switched to this PC and awake (tap a key) the
 > first time you run it. If you don't see the icon, check the tray's hidden-icons
 > overflow (the `^` chevron) and drag it onto the taskbar to keep it visible.
+
+### Where it installs
+
+`mxlight` needs no installer and writes nothing until you ask it to. The only two
+things it ever touches:
+
+- **"Start with Windows"** copies the exe to
+  `%LOCALAPPDATA%\mxlight\mxlight.exe` and adds one registry value under
+  `HKCU\…\CurrentVersion\Run` pointing at that copy. Copying to a fixed location
+  is what lets autostart keep working after you delete the file you first ran.
+- Un-checking "Start with Windows" removes that registry value. To fully remove
+  the app, **Quit** it and delete the `%LOCALAPPDATA%\mxlight` folder.
+
+---
+
+## Verifying the download
+
+You don't have to trust that the published `mxlight.exe` matches this source —
+you can **prove** it. Every release is built on GitHub's servers straight from the
+tagged commit (the full build is public on the [Actions](https://github.com/rompom777/MXLights/actions)
+tab), and each binary ships with a signed [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
+
+With the [GitHub CLI](https://cli.github.com/) installed:
+
+```bat
+gh attestation verify mxlight.exe --repo rompom777/MXLights
+```
+
+A ✓ confirms the exact file you downloaded was built by this repo's workflow from
+a specific commit — it was never hand-uploaded or modified. Each release also
+lists a **SHA-256** (and an `mxlight.exe.sha256` file) if you just want a plain
+integrity check:
+
+```powershell
+Get-FileHash mxlight.exe -Algorithm SHA256
+```
+
+---
+
+## Build it yourself
+
+Prefer to compile from source instead of downloading? You only need **Visual
+Studio 2022** (or the standalone Build Tools) with the _Desktop development with
+C++_ workload — no other dependencies.
+
+```bat
+git clone https://github.com/rompom777/MXLights.git
+cd MXLights
+build.bat
+```
+
+`build.bat` finds the MSVC toolchain automatically and produces
+`build\mxlight.exe`. (This is the exact command GitHub Actions runs to produce
+the official release binary.)
 
 ---
 
