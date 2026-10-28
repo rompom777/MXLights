@@ -17,6 +17,7 @@
 #include <setupapi.h> // SetupDi* device enumeration
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 // Links the following libraries when compiling
 #pragma comment(lib, "hid.lib")
@@ -27,6 +28,48 @@
 /* Logitech carries its HID++ control protocol on this page, so it marks the right
  * interface (instead of the generic keyboard/mouse collections). */
 #define HIDPP_USAGE_PAGE 0xFF00
+#define REPORT_SHORT 0x10       // HID++ short report id: 7-byte message
+#define REPORT_LONG 0x11        // HID++ long report id: 20-byte message
+#define SW_ID 0x0B              // This "software id": nonzero tag ORed into byte 3
+#define ROOT_FEATURE_INDEX 0x00 // The Root feature always lives at feature index 0
+#define FUNC_ROOT_PING 0x10     // Root function 1 (<<4): get protocol version
+#define REQ_TIMEOUT_MS 600      // How long we wait for a reply before giving up
+#define MAX_CANDIDATES 64       // Upper bound on HID interfaces we'll collect
+#define MAX_GROUPS 16           // Upper bound on grouped logical devices
+#define MAX_CHAN 4              // Max collections (pipes) we track per device
+
+/* Device slots to probe: 1..6 are devices on a receiver, 0xFF is the receiver. */
+/* 0xFF addresses the receiver itself. A wired/direct device typically answers on
+ * slot 0xFF too. We try all of them and see which ones reply. */
+static const uint8_t SLOTS[] = {1, 2, 3, 4, 5, 6, 0xFF};
+
+/* One "channel" = one opened HID collection (one Win32 file handle). A single
+ * physical interface exposes two of these: a short pipe and a long pipe. */
+typedef struct
+{
+    HANDLE h;              /* File handle from CreateFile (opened OVERLAPPED)  */
+    USHORT usage;          /* 1 = short pipe, 2 = long pipe */
+    USHORT inLen, outLen;  /* HID input/output report byte lengths       */
+    OVERLAPPED ov;         /* Async I/O control block for the pending read     */
+    HANDLE ev;             /* Manual-reset event signaled when the read done   */
+    unsigned char buf[64]; /* Receive buffer for one incoming report           */
+    int pending;           /* 1 while an overlapped ReadFile is in flight      */
+} Chan;
+
+/* A logical device = the set of channels that share one interface path. */
+typedef struct
+{
+    Chan ch[MAX_CHAN]; /* The grouped collections (short + long + ...)     */
+    int nch;           /* How many of ch[] are actually in use            */
+} Dev;
+
+/* A candidate is a raw enumeration hit before we group/open it for real. */
+typedef struct
+{
+    char path[512];              /* The device interface path from SetupAPI          */
+    USHORT usage, inLen, outLen; /* Capabilities read during enumeration        */
+    int grouped;                 /* Marked 1 once this candidate has been consumed   */
+} Cand;
 
 int main(void)
 {
