@@ -38,6 +38,8 @@
 #define REPORT_SHORT 0x10 // HID++ short report id: 7-byte message
 #define REPORT_LONG 0x11  // HID++ long report id: 20-byte message
 
+#define HIDPP_REPORT_MAX 64
+
 #define SW_ID 0x0B // This "software id": nonzero tag ORed into byte 3
 
 #define ROOT_FEATURE_INDEX 0x00   // The Root feature always lives at feature index 0
@@ -89,7 +91,13 @@ static UINT g_taskbar_created;  // "TaskbarCreated" broadcast (re-add icon on Ex
 
 // Current display status; only ever written on the UI thread (menu handler and
 // the WM_STATUS handler), so it needs no locking.
-enum { ST_PAUSED, ST_NO_RECEIVER, ST_SEARCHING, ST_ACTIVE };
+enum
+{
+    ST_PAUSED,
+    ST_NO_RECEIVER,
+    ST_SEARCHING,
+    ST_ACTIVE
+};
 static int g_status = ST_PAUSED;
 
 #define WM_TRAY (WM_APP + 1)   // tray-icon notifications arrive as this message
@@ -106,9 +114,9 @@ static int interrupted(DWORD ms)
     HANDLE h[2] = {g_stop, g_wake};
     DWORD w = WaitForMultipleObjects(2, h, FALSE, ms);
     if (w == WAIT_OBJECT_0)
-        return 1;                // quitting
+        return 1; // quitting
     if (w == WAIT_OBJECT_0 + 1)
-        ResetEvent(g_wake);      // toggle: consume the signal, fall through
+        ResetEvent(g_wake); // toggle: consume the signal, fall through
     return 0;
 }
 
@@ -116,13 +124,13 @@ static int interrupted(DWORD ms)
  * physical interface exposes two of these: a short pipe and a long pipe. */
 typedef struct
 {
-    HANDLE h;              /* File handle from CreateFile (opened OVERLAPPED)  */
-    USHORT usage;          /* 1 = short pipe, 2 = long pipe */
-    USHORT inLen, outLen;  /* HID input/output report byte lengths       */
-    OVERLAPPED ov;         /* Async I/O control block for the pending read     */
-    HANDLE ev;             /* Manual-reset event signaled when the read done   */
-    unsigned char buf[64]; /* Receive buffer for one incoming report           */
-    int pending;           /* 1 while an overlapped ReadFile is in flight      */
+    HANDLE h;                            /* File handle from CreateFile (opened OVERLAPPED)  */
+    USHORT usage;                        /* 1 = short pipe, 2 = long pipe */
+    USHORT inLen, outLen;                /* HID input/output report byte lengths       */
+    OVERLAPPED ov;                       /* Async I/O control block for the pending read     */
+    HANDLE ev;                           /* Manual-reset event signaled when the read done   */
+    unsigned char buf[HIDPP_REPORT_MAX]; /* Receive buffer for one incoming report */
+    int pending;                         /* 1 while an overlapped ReadFile is in flight      */
 } Chan;
 
 /* A logical device = the set of channels that share one interface path. */
@@ -234,13 +242,16 @@ static int write_report(Chan *c, const unsigned char *buf, int len)
  *        -2 : HID++ 2.0 error reply (code stored in *errcode if not NULL)
  *        -3 : HID++ 1.0 error reply (code stored in *errcode if not NULL)
  *
+ * out/outcap: the reply payload is copied into out[], truncated to outcap bytes
+ * so a device returning an oversized report can't overflow the caller's buffer.
+ *
  * mark/check_mark: used only by ping(), which puts a marker byte in the request
  * and requires the reply to echo it (so a stale reply can't be mistaken for the
  * pong).
  */
 static int hidpp_request(Dev *d, uint8_t devindex, uint8_t feat_idx, uint8_t function,
                          const uint8_t *params, int nparams,
-                         uint8_t *out, int *outlen, uint8_t *errcode,
+                         uint8_t *out, int outcap, int *outlen, uint8_t *errcode,
                          uint8_t mark, int check_mark)
 {
     uint8_t funcsw = (uint8_t)(function | SW_ID); // pack function number + our software id
@@ -275,7 +286,7 @@ static int hidpp_request(Dev *d, uint8_t devindex, uint8_t feat_idx, uint8_t fun
         wc = &d->ch[0];
 
     // Assemble the request report (zero-padded to the pipe's report length)
-    unsigned char req[64];
+    unsigned char req[HIDPP_REPORT_MAX];
     memset(req, 0, sizeof(req));
     req[0] = report_id; // byte 0: report id (short/long)
     req[1] = devindex;  // byte 1: which device/slot on the receiver
@@ -348,6 +359,8 @@ static int hidpp_request(Dev *d, uint8_t devindex, uint8_t feat_idx, uint8_t fun
                     continue;
                 }
                 int n = (int)nbytes - 4; // reply payload is everything after byte 3
+                if (n > outcap)
+                    n = outcap; // never copy past the caller's out[] buffer
                 if (n > 0)
                     memcpy(out, b + 4, (size_t)n);
                 *outlen = n > 0 ? n : 0;
@@ -523,7 +536,11 @@ static int build_devices(Cand *cands, int ncand, Dev *devs, int maxdev)
             ch->usage = cands[j].usage;
             ch->inLen = cands[j].inLen ? cands[j].inLen : 20;    // fall back to a sane size
             ch->outLen = cands[j].outLen ? cands[j].outLen : 20; // if caps were 0
-            ch->ev = CreateEvent(NULL, TRUE, FALSE, NULL);       // per-channel read event
+            if (ch->inLen > HIDPP_REPORT_MAX)
+                ch->inLen = HIDPP_REPORT_MAX;
+            if (ch->outLen > HIDPP_REPORT_MAX)
+                ch->outLen = HIDPP_REPORT_MAX;
+            ch->ev = CreateEvent(NULL, TRUE, FALSE, NULL); // per-channel read event
         }
 
         if (d->nch > 0)
@@ -554,7 +571,7 @@ static int get_feature_index(Dev *d, uint8_t devindex, uint16_t feature)
     uint8_t out[32];
     int ol = 0;
     int r = hidpp_request(d, devindex, ROOT_FEATURE_INDEX, FUNC_ROOT_GETFEATURE,
-                          params, 2, out, &ol, NULL, 0, 0);
+                          params, 2, out, sizeof(out), &ol, NULL, 0, 0);
     return (r >= 1) ? out[0] : -1; // out[0] = feature index (0 = unsupported)
 }
 
@@ -566,7 +583,7 @@ static int ping(Dev *d, uint8_t devindex)
     uint8_t out[32];
     int ol = 0;
     int r = hidpp_request(d, devindex, ROOT_FEATURE_INDEX, FUNC_ROOT_PING,
-                          params, 3, out, &ol, NULL, mark, 1);
+                          params, 3, out, sizeof(out), &ol, NULL, mark, 1);
     // On success out[0] is the major protocol version; require >= 2 (HID++ 2.0)
     return (r >= 2 && out[0] >= 2);
 }
@@ -607,7 +624,7 @@ static void bl_pulse(Dev *d, uint8_t idx, uint8_t bl, uint8_t enabled, uint8_t e
     uint8_t p[3] = {enabled, 0x00, effect};
     uint8_t out[32];
     int ol = 0;
-    hidpp_request(d, idx, bl, FUNC_BL_SET_CONFIG, p, 3, out, &ol, NULL, 0, 0);
+    hidpp_request(d, idx, bl, FUNC_BL_SET_CONFIG, p, 3, out, sizeof(out), &ol, NULL, 0, 0);
 }
 
 // One keepalive: OFF immediately followed by ON. The off->on transition is what
@@ -632,10 +649,10 @@ static DWORD WINAPI worker_thread(LPVOID arg)
     (void)arg;
     Cand cands[MAX_CANDIDATES];
     Dev devs[MAX_GROUPS];
-    int ndev = 0;        // number of open devices
-    int have = 0;        // 1 once we have the device list open
-    int misses = 0;      // consecutive "keyboard not found" scans
-    int posted = -1;     // last status we told the UI about (-1 = none yet)
+    int ndev = 0;    // number of open devices
+    int have = 0;    // 1 once we have the device list open
+    int misses = 0;  // consecutive "keyboard not found" scans
+    int posted = -1; // last status we told the UI about (-1 = none yet)
 
     for (;;)
     {
@@ -652,8 +669,8 @@ static DWORD WINAPI worker_thread(LPVOID arg)
             HANDLE h[2] = {g_stop, g_wake};
             DWORD w = WaitForMultipleObjects(2, h, FALSE, INFINITE);
             if (w == WAIT_OBJECT_0)
-                break;            // quitting
-            ResetEvent(g_wake);   // consume the resume signal
+                break;          // quitting
+            ResetEvent(g_wake); // consume the resume signal
             continue;
         }
 
@@ -930,11 +947,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
         CloseHandle(worker);
     }
 
-    if (g_ico_on) DestroyIcon(g_ico_on);
-    if (g_ico_wait) DestroyIcon(g_ico_wait);
-    if (g_ico_off) DestroyIcon(g_ico_off);
+    if (g_ico_on)
+        DestroyIcon(g_ico_on);
+    if (g_ico_wait)
+        DestroyIcon(g_ico_wait);
+    if (g_ico_off)
+        DestroyIcon(g_ico_off);
     CloseHandle(g_stop);
     CloseHandle(g_wake);
-    if (mutex) CloseHandle(mutex);
+    if (mutex)
+        CloseHandle(mutex);
     return 0;
 }
